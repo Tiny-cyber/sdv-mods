@@ -80,65 +80,93 @@ if (-not (Test-Path $modsPath)) { New-Item -ItemType Directory -Path $modsPath -
 # Save path for step 4
 $gamePath | Out-File "$env:TEMP\sdv-path.txt" -Encoding utf8
 
-# ---- Step 3: Open mod download pages ----
-Write-Host "`n[3/4] Opening mod pages in browser..."
-Write-Host "  Log in to Nexus Mods, then click 'Manual' -> 'Slow Download' on each page.`n"
+# ---- Step 3: Install mods from sdv-mods-pack.zip ----
+Write-Host "`n[3/3] Installing mods from sdv-mods-pack.zip..."
 
-$mods = @(
-    @{id=1915;  name="Content Patcher (required base)"},
-    @{id=26926; name="Sebastian After Marriage R18"},
-    @{id=26318; name="Sebastian 18+"},
-    @{id=25040; name="Sebastian Yandere R18"},
-    @{id=12393; name="Elliott Yandere R18"},
-    @{id=26010; name="Elliott Right Position"},
-    @{id=24456; name="Elliott Exclusive Story"},
-    @{id=24988; name="Elliott SM"},
-    @{id=17464; name="Shane Right Position"}
-)
-
-foreach ($mod in $mods) {
-    Write-Host "  Opening: $($mod.name)"
-    Start-Process "https://www.nexusmods.com/stardewvalley/mods/$($mod.id)?tab=files"
-    Start-Sleep -Milliseconds 800
-}
-
-Write-Host "`n  9 tabs opened. Download all of them now." -ForegroundColor Cyan
-Write-Host "  After ALL downloads finish, press Enter here.`n"
-Read-Host "Press Enter when all 9 mods are downloaded"
-
-# ---- Step 4: Install downloaded mods ----
-Write-Host "[4/4] Installing downloaded mods..."
+# Find the mod pack in Downloads
 $downloads = Join-Path $env:USERPROFILE "Downloads"
-$zips = Get-ChildItem $downloads -Filter "*.zip" | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) } | Sort-Object LastWriteTime -Descending
-
-if ($zips.Count -eq 0) {
-    # Also try .7z and .rar
-    $zips = Get-ChildItem $downloads -Filter "*.7z" | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) }
+$pack = Get-ChildItem $downloads -Filter "sdv-mods-pack.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $pack) {
+    # Also check Desktop and WeChat download locations
+    $searchPaths = @($downloads, (Join-Path $env:USERPROFILE "Desktop"), (Join-Path $env:USERPROFILE "Documents\WeChat Files"))
+    foreach ($sp in $searchPaths) {
+        $pack = Get-ChildItem $sp -Filter "sdv-mods-pack.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pack) { break }
+    }
 }
+if (-not $pack) {
+    Write-Host "  sdv-mods-pack.zip not found! Put it in Downloads folder." -ForegroundColor Red
+    Read-Host "Press Enter to exit"; exit 1
+}
+Write-Host "  Found: $($pack.FullName)"
 
+# Extract the pack
+$packDir = "$env:TEMP\sdv-mods-pack"
+if (Test-Path $packDir) { Remove-Item $packDir -Recurse -Force }
+Expand-Archive $pack.FullName -DestinationPath $packDir -Force
+
+# Process each file in the pack
 $installed = 0
-foreach ($z in $zips) {
-    try {
-        $tempDir = "$env:TEMP\sdv-mod-temp"
-        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
-        Expand-Archive $z.FullName -DestinationPath $tempDir -Force
+$files = Get-ChildItem "$packDir\sdv-mods-pack" -File -ErrorAction SilentlyContinue
+if (-not $files) { $files = Get-ChildItem $packDir -File }
 
-        $manifests = Get-ChildItem $tempDir -Recurse -Filter "manifest.json"
-        foreach ($mf in $manifests) {
-            $modFolder = $mf.Directory
-            $destFolder = Join-Path $modsPath $modFolder.Name
-            if (Test-Path $destFolder) { Remove-Item $destFolder -Recurse -Force }
-            Copy-Item $modFolder.FullName $destFolder -Recurse
-            $json = Get-Content $mf.FullName -Raw | ConvertFrom-Json
-            Write-Host "  Installed: $($json.Name) v$($json.Version)" -ForegroundColor Green
-            $installed++
+foreach ($f in $files) {
+    Write-Host "  Processing: $($f.Name)"
+    $tempDir = "$env:TEMP\sdv-mod-temp"
+    if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+
+    try {
+        if ($f.Extension -eq ".zip") {
+            Expand-Archive $f.FullName -DestinationPath $tempDir -Force
+        } elseif ($f.Extension -eq ".rar") {
+            # Try tar (Windows 10+) or fallback
+            $tarResult = & tar -xf $f.FullName -C $tempDir 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                # Create temp dir and try PowerShell COM
+                New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+                $shell = New-Object -ComObject Shell.Application
+                $zip = $shell.NameSpace($f.FullName)
+                if ($zip) {
+                    $dest = $shell.NameSpace($tempDir)
+                    $dest.CopyHere($zip.Items(), 0x14)
+                } else {
+                    Write-Host "    Cannot extract .rar - skipping (install 7-Zip for .rar support)" -ForegroundColor Yellow
+                    continue
+                }
+            }
+        }
+
+        # Find manifest.json files and install each mod
+        $manifests = Get-ChildItem $tempDir -Recurse -Filter "manifest.json" -ErrorAction SilentlyContinue
+        if ($manifests.Count -gt 0) {
+            foreach ($mf in $manifests) {
+                $modFolder = $mf.Directory
+                $destFolder = Join-Path $modsPath $modFolder.Name
+                if (Test-Path $destFolder) { Remove-Item $destFolder -Recurse -Force }
+                Copy-Item $modFolder.FullName $destFolder -Recurse
+                $json = Get-Content $mf.FullName -Raw | ConvertFrom-Json
+                Write-Host "    -> $($json.Name) v$($json.Version)" -ForegroundColor Green
+                $installed++
+            }
+        } else {
+            # No manifest - copy all contents directly to Mods
+            $items = Get-ChildItem $tempDir -Directory
+            foreach ($item in $items) {
+                $destFolder = Join-Path $modsPath $item.Name
+                if (Test-Path $destFolder) { Remove-Item $destFolder -Recurse -Force }
+                Copy-Item $item.FullName $destFolder -Recurse
+                Write-Host "    -> $($item.Name) (copied)" -ForegroundColor Green
+                $installed++
+            }
         }
     } catch {
-        Write-Host "  Skipped: $($z.Name) - $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "    -> Error: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
+# Cleanup
 if (Test-Path "$env:TEMP\sdv-mod-temp") { Remove-Item "$env:TEMP\sdv-mod-temp" -Recurse -Force }
+if (Test-Path $packDir) { Remove-Item $packDir -Recurse -Force }
 
 Write-Host "`n=============================="
 Write-Host "  Done! $installed mods installed."
